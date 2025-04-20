@@ -1,0 +1,657 @@
+#!/usr/bin/bash
+#### Written by Krisztian Poos, 2015.02.09
+#### Automated Filesystem Dump saving script 
+#### Version 0.9
+#set -x
+
+#### 1.  Before first run, copy the contents root's id_*sa.pub on the client to
+####     the fsdump's authorized_keys on mgmt3
+#### 2.  Copy the dump script to the client running this from the client: 
+#### 	 "scp fsdump@mgmt3:/fsdumppool/tools/dump.sh ."
+#### 3a. Run "nohup bash dump.sh" from root on client. 
+####
+#### 3b. On clients behind firewall, run the
+####     /fsdumppool/tools/dump-tunnel.sh $CLIENT 10022, where the 10022 is the 
+####	 tunnel port.
+####
+####	 
+
+
+
+#### Setting variables
+PATH=$PATH:/usr/sbin:/usr/opt/SUNWmd/sbin:/usr/sbin:/usr/local/bin
+CLIENT=$(uname -n)
+ROOTHOME=`getent passwd root| cut -d: -f6`
+DATE=$(date +%y%m%d.%H)
+REVISION=$DATE
+DUMPHOMEDIR=/fsdumppool/clients
+HOSTDIR=$DUMPHOMEDIR/$CLIENT
+CFGDIR=$DUMPHOMEDIR/$CLIENT/$REVISION/configs
+CFGFILE=$DUMPHOMEDIR/$CLIENT/$REVISION/configs/cfg
+LOGDIR=$HOSTDIR/logs
+LOGFILENAME="dumplog_${CLIENT}_${DATE}"
+LOGFILE=$HOSTDIR/logs/$LOGFILENAME
+DUMPSERVER=mgmt3
+DUMPUSER=fsdump
+MAXREV=5
+SOLREL=$(uname -r)
+SOLVER=$(uname -v | awk -F"." '{ print $2; }')
+#MD5SUM_L=$(md5sum /root/dump.sh)
+#Default zone is the global zone: 
+zname=global
+
+if [ ${SOLREL} = "5.9" ]
+then
+        SCP="scp -2"
+	SSH="ssh -2"
+else
+        SCP="scp"
+	SSH="ssh"
+fi
+
+#### Check network segment
+tunnel=0;
+function network_check {
+  IP=$(getent hosts $CLIENT | awk {'print $1'})
+  IPSUM=$(echo $IP |  awk -F. '{ print $1 $2 $3 }' )
+  SUBNET=$(echo $IP | awk -F. '{ print $1"."$2"."$3}' )
+  if [ $IPSUM -eq 172184 -o $IPSUM -eq 172204 -o $IPSUM -eq 172185 ]; then 
+    if [ -z $SSHPORT ]; then  
+      echo "This is zone $SUBNET, but no SSH Tunnel port given, exiting."
+      exit 1
+    fi 
+    SSH="$SSH -p $SSHPORT"
+    SCP="$SCP -P $SSHPORT"
+    DUMPSERVER=localhost
+    echo "This is zone $SUBNET, connecting back to tunnel on $SSHPORT" 
+
+    #### Check if the Tunnel is up...
+    echo "Checking if the Tunnel is established..." 
+    PORTSTATE=$(netstat -an | grep ^127.0.0.1.$SSHPORT | awk '{ print $NF }') 
+    if [[ $PORTSTATE != "LISTEN" ]]; then 
+      echo "The Tunnel is not up. Exiting."
+      echo "Start the dump-tunnel.sh script from DUMPSERVER" 
+      exit 1;  
+    else
+      echo "The Tunnel is up. Continuing."  
+      tunnel=1
+    fi 
+  else
+      echo "This is zone $SUBNET, no need for tunnel, connecting back to $DUMPSERVER" 
+      tunnel=0
+  fi 
+}
+
+#### Check and create crontab entry
+function cron_check {
+  number=$RANDOM
+  offset=15
+
+  #min=$(let("number%=60"))
+  let "number %= 59"
+  min=$(expr $number + 1)
+
+  number=$RANDOM
+  let "number %= 23"
+  hour=$(expr $number + 1)
+
+  number=$RANDOM
+  let "number %= 6"
+  dom=$(expr $number + 1)
+  dom2=$dom
+  let "dom2 += offset"
+
+  #echo "$min $hour $dom,$dom2 * *"
+  echo_log "Saving crontab" 0
+  croncmd="/root/dump.sh 2> /root/dump.sh_cron_errors < /dev/null"
+  echo "."
+
+  cronjob="$min $hour $dom,$dom2 * * $croncmd"
+  crontab -l | $SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${CFGDIR}/crontab"
+  ### crontab - does not work on solaris
+  ###( crontab -l | grep -v "$croncmd" ; echo "$cronjob" ) | crontab -
+  crontab -l| grep "$croncmd" || cat <(crontab -l) <(echo "$cronjob") | crontab 
+
+}
+
+#### Delete /var/core and /var/crash contents if exists
+function delete_dir {
+  DIR=$1
+  if [ -d $DIR ]; then
+    NUMFILES=`ls ${DIR} | wc -w`
+    if [ $NUMFILES -gt 0 ]; then
+      echo_log "Directory: ${DIR} contains ${NUMFILES} files, deleting..." 0
+      DELFILES=$(find ${DIR} -type f ! -name minfree -exec echo rm \{\} +)
+#     send file names to be deleted to the log.
+      echo_log "${DELFILES}" 0
+#     delete files
+      find ${DIR} -type f ! -name minfree -exec rm \{\} + 
+      echo_log "."
+    else
+      echo_log "Directory: ${DIR} is empty, no need for deletion" 0
+    fi
+  else 
+    echo_log "Directory: ${DIR} does not exists, no need for deletion" 0
+  fi
+}
+#### END FUNCTION
+
+#### Delete old dumps
+function delete_old {
+HOSTDIR=$DUMPHOMEDIR/$CLIENT
+
+   DIRCOUNT=$($SSH $DUMPUSER@$DUMPSERVER "ls $HOSTDIR | awk '\$NF == \"logs\" {next} {print}'| wc -w")
+   echo_log "Total number of dump revisions: $DIRCOUNT" 
+   if [ $DIRCOUNT -eq $MAXREV ]; then
+     echo_log "Need to delete old dumps:" 0 
+     DELDIR=$($SSH $DUMPUSER@$DUMPSERVER "ls $HOSTDIR | awk '\$NF == \"logs\" {next} {print $1}' | head -1")
+   echo_log "- $HOSTDIR/$DELDIR" 0
+     $SSH $DUMPUSER@$DUMPSERVER "rm -r $HOSTDIR/$DELDIR"
+  fi
+  if [ $DIRCOUNT -gt $MAXREV ]; then
+    echo_log "Need to delete old dumps:" 0
+    while [ $DIRCOUNT -ne $MAXREV ]
+    do
+        DELDIR=$($SSH $DUMPUSER@$DUMPSERVER "ls $HOSTDIR | awk '\$NF == \"logs\" {next} {print $1}' | head -1")
+	echo_log "- $HOSTDIR/$DELDIR" 0
+        $SSH $DUMPUSER@$DUMPSERVER "rm -r $HOSTDIR/$DELDIR"
+        let DIRCOUNT=$DIRCOUNT-1
+    done
+  fi
+  if [ $DIRCOUNT -lt $MAXREV ]; then
+    echo_log "No need for deletion" 0
+  fi
+}
+#### END FUNCTION 
+
+function echo_log {
+  string=$1
+
+  if [[ -z $2 ]]; then
+    nl=1
+  else
+    nl=0
+  fi
+
+  if [[ $nl -eq 0 ]]; then
+    echo "$string"
+    $SSH $DUMPUSER@$DUMPSERVER "test -d $HOSTDIR/logs && echo "$string" >> $LOGFILE"
+  else
+    echo "$string"
+    $SSH $DUMPUSER@$DUMPSERVER "test -d $HOSTDIR/logs && echo "$string" >> $LOGFILE"
+  fi
+}
+#### END FUNCTION 
+
+function handle_existing_rev { 
+
+  check_ret_value()
+  {
+  if [ $? = 0 ] 
+  then
+     echo "Revision -> ${REVISION} for ${TARGETDIR} <- already exists"
+     echo -n "Do you want to overwrite [yes/NO]?"
+     ANSWER="NO"
+     while [ "$ANSWER" != "yes" ]
+     do
+	read ANSWER
+	if [ "$ANSWER" = "NO" -o "$ANSWER" = "" ]
+	then
+	  exit
+	fi
+	if [ "$ANSWER" != "yes" ]
+	then
+	  echo "Please answer "yes" or "NO""
+	fi
+     done
+  fi
+  }
+  TARGETDIR=${CLIENT}
+  $SSH ${DUMPUSER}@${DUMPSERVER} "test -d ${DUMPHOMEDIR}/${CLIENT}/${REVISION}"
+  check_ret_value
+}
+#### END FUNCTION
+
+
+function save_config {
+
+  $SSH ${DUMPUSER}@${DUMPSERVER} "test -d ${DUMPHOMEDIR}/${CLIENT}/${REVISION}/configs || mkdir -p ${DUMPHOMEDIR}/${CLIENT}/${REVISION}/configs"
+
+  typeset ret
+  bootdisk=""
+### root fs is on ZFS
+  ret=$(zfs list / 2>/dev/null| awk '$5 == "/" {print $0}' | wc -l )
+  if [[ $ret -gt 0 ]]; then
+    zfs=1
+    zfs_config
+  else 
+    zfs=0
+  fi
+### root slice is under SDS control 
+  ret=$(cat /etc/vfstab | awk ' $3 == "/" {print $0}' | egrep "^/dev/md/dsk"  |wc -l )
+  if [[ $ret -gt 0 ]]; then
+    sds=1
+    sds_config
+  else
+    sds=0
+  fi
+### simple ufs config
+  if [ $zfs -eq 0 -a $sds -eq 0 ];then
+     ufs_config
+  fi
+
+### saving partition table without slice 2, so we can use it on different disks with fmthard
+# if [ $zfs -eq 0 ]; then 
+  if [ $zname == "global" ]; then
+  echo_log "Saving partition table of ${bootdisk} to $DUMPSERVER:${CFGDIR}/vtoc.${bootdisk}" 0
+  bootdisk=$(echo $bootdisk | sed 's/s.$//') 
+  prtvtoc /dev/rdsk/${bootdisk}s2 | awk '$2!= "5" { print }' | $SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${CFGDIR}/vtoc.${bootdisk}"
+  if [ ! -z $bootmirror ]; then
+    echo_log "Saving partition table of ${bootmirror} to $DUMPSERVER:${CFGDIR}/vtoc.${bootmirror}" 0
+    bootmirror=$(echo $bootmirror | sed 's/s.$//')
+    prtvtoc /dev/rdsk/${bootmirror}s2  | awk '$2!= "5" { print }' | $SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${CFGDIR}/vtoc.${bootmirror}"
+  fi
+
+#  fi
+  echo_log "."
+  fi
+
+### save df -k 
+
+echo_log "Saving df -k output" 1
+df -k |$SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${CFGDIR}/df"
+echo_log "."
+
+
+echo_log "Saving hostid" 1
+echo "HOSTID=`hostid`" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+echo_log "."
+
+
+}
+#### END FUNCTION
+
+
+#### UFS config
+function ufs_config {
+  bootpart=$( cat /etc/vfstab | awk ' $3 == "/" { print $1 }' | sed 's?/dev/dsk/\(.*\)?\1?' )
+  bootdisk=`echo $bootpart | sed 's?\(.*\)s.\{1,2\}?\1?'`
+  bootslice=`echo $bootpart | sed 's?.*s\(.\{1,2\}\)?\1?'`
+  boothwpath=`ls -l /dev/dsk/$bootpart | awk '{print $11}'`
+  echo_log "Bootdisk ${bootdisk} is NOT ZFS or SDS control"
+  echo "BOOTDISK=${bootdisk}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+  echo "BOOTSLICE=${bootslice}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+  echo "BOOTHWPATH=${boothwpath}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+  echo_log "."
+
+  FS=$( cat /etc/vfstab |  sed 's/#.*//'| grep $bootdisk | awk '$4 != "swap" { ORS=" "; print $3 }')
+  echo "FILESYSTEM=\"${FS}\"" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+
+### save the vfstab
+
+  echo_log "Saving vfstabs" 1 
+  test -f /etc/vfstab && $SCP /etc/vfstab ${DUMPUSER}@${DUMPSERVER}:${CFGDIR}/vfstab
+  echo_log "."
+}
+#### END FUNCTION
+
+#### ZFS config
+function zfs_config {
+   echo_log "Bootdisk has ZFS filesystem"
+   poolname=$(zfs list /| awk '$1=="NAME" {next} {print $1}' | awk -F"/" '{ print $1}')
+   echo "ZPOOL=${poolname}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   echo_log "Saving 'zpool get all ${poolname}' output" 0
+   echo "\nZPOOL ATTR:\n`zpool get all ${poolname}`"| $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   echo "."
+   echo_log "Saving 'zpool ${poolname} status' output" 0
+   echo "\nZPOOL STATUS:\n`zpool status ${poolname}`" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   echo "."
+   echo_log "Saving 'zfs get all ${poolname}' output" 0
+   echo "\nZFS ATTR:\n`zfs get all ${poolname}`" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   echo "."
+   # check if the zfs is in a zone or not
+   zname=$(zonename)
+   # check if the pool is mirrored or raidz 
+#   poolstatus=$(zpool status ${poolname}| grep state| awk '{print $NF}') #### command gives one more state line when pool is DEGRADED
+   poolstatus=$(zpool status ${poolname}| awk '$1=="state:" {print $NF}')
+   pooldevnum=$(zpool status ${poolname} | grep -v ^$ | awk '$NF!='${poolstatus}' { next } { print $1 }' | wc -l ) 
+   pooltype=$(zpool status ${poolname}| grep ${poolstatus} | awk '$1=="rpool" {next} /mirror/||/raidz/ {print $1}' )
+   case  $pooltype in 
+   *mirror*)  
+     echo_log "${poolname} is mirrored" 0
+     pooldevs=( $(zpool status ${poolname} | grep -v ^$| awk '$NF!='${poolstatus}' { next } { print $1 }' ) )
+     if [ $zname == "global" ];
+     then 
+       bootdisk=${pooldevs[2]}
+       bootmirror=${pooldevs[3]}
+       echo "BOOTDISK=${bootdisk}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+       echo "BOOTMIRR=${bootmirror}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+       boothwpath=`ls -l /dev/dsk/$bootdisk | awk '{print $11}'`
+       bootmirrorhwpath=`ls -l /dev/dsk/$bootmirror | awk '{print $11}'`
+       echo "BOOTHWPATH=${boothwpath}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+       echo "BOOTMIRRORHWPATH=${bootmirrorhwpath}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+     else
+       echo_log "$CLIENT is a Zone! Not saving bootdisk, bootpath and vtoc!" 0
+     fi
+     echo_log "."
+   ;;
+   *raidz*)
+     echo_log "${poolname} is raidz" 0
+     echo_log "RAIDZ is not managed by this script!" 0
+     exit 2
+   ;;
+   *) 
+     if [ $zname == "global" ];
+     then
+       bootdisk=$(zpool status ${poolname} | grep ${poolstatus} | grep -v state | grep -v ${poolname} | awk '{print $1}'  )
+       boothwpath=`ls -l /dev/dsk/$bootdisk | awk '{print $11}'`
+  #    bootslice=`echo $bootpart | sed 's?.*s\(.\{1,2\}\)?\1?'`
+       boothwpath=`ls -l /dev/dsk/$bootdisk | awk '{print $11}'`
+       echo "BOOTDISK=${bootdisk}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+  #    echo "BOOTSLICE=${bootslice}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+       echo "BOOTHWPATH=${boothwpath}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+     else
+       echo_log "$CLIENT is a Zone! Not saving bootdisk, bootpath and vtoc!" 0
+     fi
+     echo_log "."
+   ;;
+  esac
+### save the vfstab
+
+  echo_log "Saving vfstabs" 1
+  test -f /etc/vfstab && $SCP /etc/vfstab ${DUMPUSER}@${DUMPSERVER}:${CFGDIR}/vfstab
+  echo_log "."
+}
+#### END FUNCTION
+
+#### SDS config
+
+function sds_config {
+echo_log "Bootdisk ${bootdisk} is under SDS control"
+
+   ROOT_MD=$(cat /etc/vfstab | grep -v '#' |  awk ' $3 == "/" {print $1}')
+   ROOT_MDS=`echo $ROOT_MD |sed "s?/dev/md/dsk/\(.*\)?\1?"`
+   MIRROR_COUNT=0
+   MIRROR_COUNT=`metastat $ROOT_MDS |grep  "Submirror of $ROOT_MDS" |wc -l`
+   if [ $MIRROR_COUNT -eq 0  ]
+   then
+      echo "ERROR: no bootdisk found ---> EXIT"
+      exit 2
+   elif [ $MIRROR_COUNT -gt 2 ]
+   then
+      echo "ERROR: more than two mirrors found for rootdevice $ROOT_MDS"
+      echo "       Please remove one mirror from the device and restart"
+      exit 2
+   fi
+   bootmetadevice=`metastat $ROOT_MDS |grep  "Submirror of $ROOT_MDS" |head -1 | cut -d":" -f1 `
+#   bootpart=`metastat -p $bootmetadevice| awk '{ print $NF }'`
+#   nbumast has full /dev/dsk/... path in metastat output, so need to awk more for last field
+   bootpart=`metastat -p $bootmetadevice | awk '{ print $NF }' | awk -F"/" '{ print $NF}'`
+   bootdisk=`echo $bootpart | sed s'?/dev/dsk/\(.*\)?\1?' | sed 's?\(.*\)s.\{1,2\}?\1?'`
+   bootslice=`echo $bootpart | sed s'?/dev/dsk/\(.*\)?\1?' | sed 's?.*s\(.\{1,2\}\)?\1?'`
+   boothwpath=`ls -l /dev/dsk/$bootpart | awk '{print $11}'`
+   
+   echo "SDS=$sds" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+   echo "BOOTSLICE=${bootslice}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   echo "BOOTDISK=${bootdisk}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   echo "BOOTHWPATH=${boothwpath}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   echo "ROOT_MD=${ROOT_MDS}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+   if [ $MIRROR_COUNT -eq 2  ]
+   then
+       bootmirrormetadevice=`metastat $ROOT_MDS |grep  "Submirror of $ROOT_MDS" |tail -1 | cut -d":" -f1 `
+#       bootmirrorpart=`metastat -p $bootmirrormetadevice| awk '{ print $NF }'`
+#       nbumast has full /dev/dsk/... path in metastat output, so need to awk more for last field
+       bootmirrorpart=`metastat -p $bootmirrormetadevice | awk '{ print $NF }' | awk -F"/" '{ print $NF}'`
+       bootmirror=`echo $bootmirrorpart | sed 's?\(.*\)s.?\1?'| sed s'?/dev/dsk/\(.*\)?\1?'`
+       bootmirrorhwpath=`ls -l /dev/dsk/$bootmirrorpart | awk '{print $11}'`
+       
+       echo "BOOTMIRROR=${bootmirror}"  | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+       echo "BOOTMIRRORHWPATH=${bootmirrorhwpath}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+   fi
+
+####  find metadb's 
+
+metadbs=$( metadb | awk '$NF == "count" {next}; $NF != prev  { ORS=" "; print substr($NF,10); prev = $NF }' )
+for i in ${metadbs}
+do
+        metacount=$(metadb | grep -c $i)
+        metadbcount="${metadbcount} ${metacount}:${i}"
+done
+	echo "METADBS=\"$metadbcount\"" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+
+####  filesystems on rootdisk 
+
+pick_fs ()
+{
+res=`cat /etc/vfstab | tr "\t"  " " | grep "^\/dev\/md/\dsk/\$1 " | awk ' $4 != "swap" { ORS=" "; print $3}'`
+if [ "$res" ]
+then
+        FS="$FS$res"
+fi
+if [ "$res" -a "$SOFTPART" ]
+then
+        FS_SOFT="$FS_SOFT$res"
+fi
+}
+
+for SUBMIRROR in `metastat -p | sort -n | grep -v "\-m" | grep $bootdisk | awk ' { print $ 1 } '`
+do
+        MD_DEVICE=`metastat -p | grep "\-m" | grep "$SUBMIRROR " | awk ' { print $ 1 } '`
+        SOFTPART=`metastat -p | grep "\-p" | grep "$MD_DEVICE " | awk ' { print $ 1 } '`
+        if [  ! "$SOFTPART" ]
+        then
+                pick_fs $MD_DEVICE
+        else
+                for i in $SOFTPART
+                do
+                        pick_fs $i
+                done
+        fi
+done
+echo FILESYSTEM=\"$FS\" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+echo FSINSOFTPART=\"$FS_SOFT\" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+
+
+#### save metastat -p output 
+
+echo_log "Saving metastat -p output" 1
+echo "METACFG=\"$(metastat -p)\"" |$SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+echo_log "."
+
+echo_log "Saving MD_PAIRS"
+MD_PAIRS=""
+SUB_MIRROR=$(metastat -p | grep $bootdisk | awk ' {print $1}' )
+
+MD_DEVICE=$(metastat -p | egrep "$SUB_MIRROR" |awk '$2 == "-m" { print $1 }')
+if [ "$bootmirror" != "" ]
+then
+   for MD in ${MD_DEVICE}; do
+     MD_MIRROR=$(metastat -p $MD | grep ${bootmirror}| awk '{ print $1 }')
+     if [ ! -z $MD_MIRROR ]
+     then
+        MD_PAIRS="${MD_PAIRS} $MD:$MD_MIRROR"
+     else
+        echo_log "WARNING: mirror for $MD not found on same disk as rootmirror"
+	echo_log "         please create the mirror manually after ufsrestore"
+     fi
+   done
+fi
+echo "MD_PAIRS=\"${MD_PAIRS}\"" |$SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}" 
+echo_log "."
+
+#### save vfstab's 
+
+echo_log "Saving vfstabs" 1
+
+SDSTAB=$(cat /etc/vfstab | sed 's/\/dev\/md/\/dev/g' )
+for i in ${MD_DEVICE}; do
+  SLICE=$(metastat -p ${i} | grep ${bootdisk} | awk '{ print $NF }' | sed 's?/dev/dsk/\(.*\)?\1?')
+  SDSTAB=$(echo "$SDSTAB" | sed "s?/${i}?/$SLICE?g" | sed 's?//?/?g')
+done
+
+if [ "$FS_SOFT" != "" ]
+then
+        for DELFS in $FS_SOFT
+        do
+                DEL=`echo $DELFS | sed 's/ //g'`
+                SDSTAB=`echo "${SDSTAB}" | grep -v "$DEL"`
+        done
+fi
+
+echo "${SDSTAB}" | $SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${CFGDIR}/vfstab"
+
+echo_log "."
+
+#### save system.nonsds 
+
+echo_log "Saving system.nonsds" 1
+SDSSYSTEM=$(cat /etc/system | awk ' /Begin MDD/, /End MDD/ { next }; { print }')
+echo "${SDSSYSTEM}" | $SSH  ${DUMPUSER}@${DUMPSERVER} "cat >${CFGDIR}/system.nonsds"
+echo_log "."
+
+echo "SOLARIS="`uname -r`|$SSH ${DUMPUSER}@${DUMPSERVER} "cat >>${CFGFILE}"
+}
+
+#### END FUNCTION 
+
+
+#### Dumping all the FS
+
+function do_dump {
+  DATADIR=${DUMPHOMEDIR}/${CLIENT}/${REVISION}/data
+  for fs in ${FS[*]}; do
+    if [[ $fs = "/" ]]; then
+      echo_log "Dumping $fs to ${DATADIR}/root" 0
+
+      $SSH ${DUMPUSER}@${DUMPSERVER} "test -d ${DATADIR} || mkdir -p ${DATADIR}"
+      
+      ufsdump 0f - $fs | gzip -c | $SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${DATADIR}/root.gz"
+
+      ret=$?
+      if [[ $ret -ne 0 ]]; then
+        echo_log " failed with error code $ret."
+	#	exit 1;
+      else
+        echo_log "."
+      fi
+
+    else
+      FSDUMP=`echo $fs | sed 's?^/??g' | sed 's?/?_-_?g' | sed 's?^?/?' `
+      echo_log "Dumping $fs to ${DATADIR}$FSDUMP" 0
+
+      $SSH ${DUMPUSER}@${DUMPSERVER} "test -d ${DATADIR} || mkdir -p ${DATADIR}"
+      
+      ufsdump 0f - $fs | gzip -c | $SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${DATADIR}/${FSDUMP}.gz "
+      ret=$?
+      if [[ $ret -ne 0 ]]; then
+       echo_log " failed with error code $ret."
+	#	exit 1;
+      else
+        echo_log "."
+      fi
+
+    fi
+  done
+}
+#### END FUNCTION 
+
+#### Create ZFS backup
+
+function do_zfs_dump {
+  if [ $poolstatus = "ONLINE" ];
+  then
+  DATADIR=${DUMPHOMEDIR}/${CLIENT}/${REVISION}/data
+    echo_log "Creating ZFS snapshot named ${poolname}@${DATE}" 0
+    #creating the zfs snapshot
+    #zfs snapshot -r ${poolname}@${DATE}
+    #zfs list -H -r ${poolname} | grep -v ${poolname}/dump| grep -v ${poolname}/swap | nawk -v var=$DATE '{ print "zfs snapshot "$1"@"var }' | sh
+    #zfs list -H -r ${poolname} | egrep -v ${poolname}\/[dump,swap] | nawk -v var=$DATE '{ print "zfs snapshot "$1"@"var }' | sh
+    zfs list -H -r ${poolname} | egrep -v ${poolname}\/'dump|swap|\@' | nawk -v var=$DATE '{ print "zfs snapshot "$1"@"var }' | sh
+    ret=$?
+    if [[ $ret -ne 0 ]]; then
+      echo_log " failed with error code $ret."
+    else     
+
+      #destroying swap and dumpdevice snapshot, as that not contains needed information, only occupies the space.
+      zfs destroy ${poolname}/swap@${DATE}
+      zfs destroy ${poolname}/dump@${DATE}
+      echo_log "Sending ZFS snapshot to $DUMPSERVER:${DATADIR}/${poolname}" 0
+      $SSH ${DUMPUSER}@${DUMPSERVER} "test -d ${DATADIR} || mkdir -p ${DATADIR}"
+      zfs send -Rv ${poolname}@${DATE} | gzip -c | $SSH ${DUMPUSER}@${DUMPSERVER} "cat > ${DATADIR}/${poolname}.gz"
+      ret=$?
+      if [[ $ret -ne 0 ]]; then
+        echo_log " failed with error code $ret."
+      else
+        echo_log "."
+      fi
+      echo_log "."
+    fi
+
+    #destroying the snapshot.
+    zfs destroy -r ${poolname}@${DATE}
+  else
+    echo_log "Zpool ${poolname} status is: $poolstatus. Please check before dumping."
+    exit 2
+  fi
+}
+#### END FUNCTION
+
+#### Create Unified Archive (recovery type)
+
+function do_unified_archive {
+  DATADIR=${DUMPHOMEDIR}/${CLIENT}/${REVISION}/data
+  echo_log "Creating Unified Archive (recovery type) of ${CLIENT} " 0
+  archiveadm create -r ${ClIENT}.uar
+  ret=$?
+  if [[ $ret -ne 0 ]]; then
+    echo_log " failed with error code $ret."
+  else
+    echo_log "."
+  fi
+}
+#### END FUNCTION
+
+#### MAIN CODE
+if [[ $# -gt 0 ]]; then 
+  SSHPORT=$1
+#  network_check
+fi
+network_check
+delete_dir /var/crash/${CLIENT}
+delete_dir /var/core 
+delete_dir /var/cores
+
+#### Check and/or create client directories
+echo_log "Checking/creating directory structure... " 1;
+$SSH ${DUMPUSER}@${DUMPSERVER} "test -d ${DUMPHOMEDIR}/${CLIENT}/ || mkdir -p ${DUMPHOMEDIR}/${CLIENT}"
+$SSH ${DUMPUSER}@${DUMPSERVER} "test -d ${DUMPHOMEDIR}/${CLIENT}/logs || mkdir -p ${DUMPHOMEDIR}/${CLIENT}/logs"
+
+handle_existing_rev 
+save_config
+
+if [[ $tunnel -eq 0 ]]; then  
+  cron_check
+fi
+
+echo_log "Starting DUMP `date` "
+echo_log "."
+
+if [[ $SOLREL = "5.11" ]];
+then
+  if [[ $SOLVER -gt 2 ]];
+    then
+      do_unified_archive
+    else
+      do_zfs_dump
+  fi
+else
+  do_dump
+fi
+if [[ $ret -eq 0 ]]; then
+  delete_old
+  echo_log "."
+else 
+  echo_log "Because of unsuccessful dump, skipping deletion of old dumps " 0
+  echo_log "."
+fi
+echo_log " DUMP finished `date` " 0
